@@ -32,6 +32,7 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.types.llms.anthropic import (
     ANTHROPIC_HOSTED_TOOLS,
     ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER,
+    ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES_BETA_HEADER,
     ANTHROPIC_OAUTH_BETA_HEADER,
     ANTHROPIC_OAUTH_TOKEN_PREFIX,
     AllAnthropicToolsValues,
@@ -326,6 +327,22 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         """
         file_ids: Final = get_file_ids_from_messages(messages)
         return len(file_ids) > 0
+
+    def is_mid_conversation_tool_change_used(self, messages: Sequence[AllMessageValues]) -> bool:
+        for message in messages:
+            if message["role"] != "system":
+                continue
+            if not isinstance(message["content"], list):
+                continue
+            for block in message["content"]:
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") in ("tool_addition", "tool_removal")
+                    and isinstance(block.get("tool"), dict)
+                    and block["tool"].get("type") == "tool_reference"
+                ):
+                    return True
+        return False
 
     def is_mid_conversation_output_config_used(self, messages: list[AllMessageValues]) -> bool:
         """
@@ -859,6 +876,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         *,
         custom_llm_provider: str,
         is_mid_conversation_output_config_used: bool = False,
+        is_mid_conversation_tool_change_used: bool = False,
     ) -> list[str]:
         """
         Get list of common beta headers based on the features that are active.
@@ -894,7 +912,10 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         if is_mid_conversation_output_config_used:
             betas.append(ANTHROPIC_MID_CONVERSATION_OUTPUT_CONFIG_BETA_HEADER)
 
-        return list(set(betas))
+        tool_change_betas: Final = (
+            (ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES_BETA_HEADER,) if is_mid_conversation_tool_change_used else ()
+        )
+        return list(set(betas).union(tool_change_betas))
 
     @staticmethod
     def _make_api_key_auth_header(api_key: str, api_base: str | None, use_bearer_for_custom_base: bool = False) -> dict:
@@ -927,6 +948,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         api_base: str | None = None,
         use_bearer_for_custom_base: bool = False,
         is_mid_conversation_output_config_used: bool = False,
+        is_mid_conversation_tool_change_used: bool = False,
     ) -> dict:
         betas: Final = set()
         # Anthropic no longer requires the prompt-caching beta header
@@ -983,6 +1005,10 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         if user_anthropic_beta_headers is not None:
             betas.update(user_anthropic_beta_headers)
 
+        all_betas: Final = betas.union(
+            (ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES_BETA_HEADER,) if is_mid_conversation_tool_change_used else ()
+        )
+
         # Don't send any beta headers to Vertex, except web search which is required
         if is_vertex_request is True:
             # Vertex AI requires web search beta header for web search to work
@@ -990,8 +1016,8 @@ class AnthropicModelInfo(BaseLLMModelInfo):
                 from litellm.types.llms.anthropic import ANTHROPIC_BETA_HEADER_VALUES
 
                 headers["anthropic-beta"] = ANTHROPIC_BETA_HEADER_VALUES.WEB_SEARCH_2025_03_05.value
-        elif len(betas) > 0:
-            headers["anthropic-beta"] = ",".join(betas)
+        elif len(all_betas) > 0:
+            headers["anthropic-beta"] = ",".join(all_betas)
 
         return headers
 
@@ -1049,6 +1075,7 @@ class AnthropicModelInfo(BaseLLMModelInfo):
             auth_token=auth_token,
             file_id_used=file_id_used,
             is_mid_conversation_output_config_used=is_mid_conversation_output_config_used,
+            is_mid_conversation_tool_change_used=self.is_mid_conversation_tool_change_used(messages),
             web_search_tool_used=web_search_tool_used,
             is_vertex_request=optional_params.get("is_vertex_request", False),
             user_anthropic_beta_headers=user_anthropic_beta_headers,

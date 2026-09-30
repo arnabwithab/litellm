@@ -130,3 +130,28 @@ def test_json_provider_passthrough_adds_per_turn_control_beta():
     )
 
     assert PER_TURN_CONTROL in _betas(headers)
+
+
+@pytest.mark.parametrize("action", (None, "tool_addition", "tool_removal"))
+@pytest.mark.parametrize("explicit_beta", (False, True))
+def test_native_messages_tool_changes_beta(action: str | None, explicit_beta: bool) -> None:
+    from typing import Final
+
+    from litellm.types.llms.anthropic import ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES_BETA_HEADER
+
+    beta: Final = ANTHROPIC_MID_CONVERSATION_TOOL_CHANGES_BETA_HEADER
+    content: Final = (
+        [{"type": action, "tool": {"type": "tool_reference", "name": "mcp__test__ping"}}]
+        if action
+        else "Answer briefly"
+    )
+    headers, _ = AnthropicMessagesConfig().validate_anthropic_messages_environment(
+        headers={"anthropic-beta": beta} if explicit_beta else {},
+        model="claude-fable-5-1",
+        messages=["not a message dict", {"role": "user", "content": "Hello"}, {"role": "system", "content": content}],
+        optional_params={},
+        litellm_params={},
+        api_key="sk-ant-test",
+    )
+
+    assert headers.get("anthropic-beta", "").split(",").count(beta) == int(action is not None or explicit_beta)
