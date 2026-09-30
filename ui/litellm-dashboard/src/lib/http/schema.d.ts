@@ -75410,7 +75410,9 @@ export interface operations {
     };
     get_agent_trace_v1_traces__trace_id__get: {
         parameters: {
-            query?: never;
+            query?: {
+                trace_ref?: string;
+            };
             header?: never;
             path: {
                 trace_id: string;
@@ -75441,7 +75443,9 @@ export interface operations {
     };
     get_agent_trace_span_v1_traces__trace_id__spans__span_id__get: {
         parameters: {
-            query?: never;
+            query?: {
+                trace_ref?: string;
+            };
             header?: never;
             path: {
                 trace_id: string;
