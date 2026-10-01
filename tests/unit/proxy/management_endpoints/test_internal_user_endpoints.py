@@ -4546,19 +4546,9 @@ async def test_user_update_hashes_and_persists_strong_password(_admin_prisma, mo
     assert written_data["last_breach_check_at"] is None
 
 
-@pytest.fixture
-def hibp_httpx_transport(monkeypatch):
-    import litellm
-
-    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
-    litellm.in_memory_llm_clients_cache.flush_cache()
-    yield
-    litellm.in_memory_llm_clients_cache.flush_cache()
-
-
 @pytest.mark.asyncio
 @respx.mock
-async def test_user_update_rejects_breached_password(_admin_prisma, hibp_httpx_transport):
+async def test_user_update_rejects_breached_password(_admin_prisma, httpx_transport):
     """A strength-passing password found in the HIBP corpus must be rejected
     before it ever reaches the DB write."""
     from litellm.proxy.management_endpoints.internal_user_endpoints import (
