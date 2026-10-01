@@ -39,7 +39,7 @@ from litellm.proxy.management_endpoints.internal_user_endpoints import (
 )
 from litellm.proxy.proxy_server import app
 from litellm.types.proxy.management_endpoints.internal_user_endpoints import InsensitiveContains
-from tests.test_litellm.proxy.management_endpoints.jwt_key_mapping_doubles import (
+from tests.unit.proxy.management_endpoints.jwt_key_mapping_doubles import (
     CascadingJWTMappingTable,
     JWTMappingRow,
 )
@@ -4546,9 +4546,19 @@ async def test_user_update_hashes_and_persists_strong_password(_admin_prisma, mo
     assert written_data["last_breach_check_at"] is None
 
 
+@pytest.fixture
+def hibp_httpx_transport(monkeypatch):
+    import litellm
+
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    litellm.in_memory_llm_clients_cache.flush_cache()
+    yield
+    litellm.in_memory_llm_clients_cache.flush_cache()
+
+
 @pytest.mark.asyncio
 @respx.mock
-async def test_user_update_rejects_breached_password(_admin_prisma):
+async def test_user_update_rejects_breached_password(_admin_prisma, hibp_httpx_transport):
     """A strength-passing password found in the HIBP corpus must be rejected
     before it ever reaches the DB write."""
     from litellm.proxy.management_endpoints.internal_user_endpoints import (
