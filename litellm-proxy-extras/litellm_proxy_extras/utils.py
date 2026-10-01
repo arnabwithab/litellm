@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -13,6 +14,7 @@ from typing import TYPE_CHECKING, Final, Optional
 
 from litellm_proxy_extras import prisma_toolchain
 from litellm_proxy_extras._logging import logger
+from litellm_proxy_extras.migration_lock import held_migration_lock
 from litellm_proxy_extras.prisma_toolchain import (
     PRISMA_COMMAND_TIMEOUT_ENV_VAR,
     PRISMA_MIGRATE_DEPLOY_TIMEOUT_ENV_VAR,
@@ -24,6 +26,7 @@ from litellm_proxy_extras.replica_identity import (
     REPLICA_IDENTITY_FULL_ENV_VAR,
     apply_replica_identity_full,
 )
+from litellm_proxy_extras.request_log_indexes import ensure_request_log_indexes, filter_request_log_index_diff
 
 if TYPE_CHECKING:
     import psycopg
@@ -434,6 +437,20 @@ class ProxyExtrasDBManager:
         return False
 
     @staticmethod
+    def _filter_startup_owned_drift(diff_sql: str) -> str:
+        """The drift script without the indexes the startup step builds (the schema
+        declares them, the migrations deliberately do not) and, when LiteLLM_SpendLogs
+        is partitioned, without its primary-key rewrite and partitioning artifacts."""
+        without_indexes: Final = filter_request_log_index_diff(diff_sql)
+        if not ProxyExtrasDBManager.spend_logs_is_partitioned():
+            return without_indexes
+        logger.info(
+            "LiteLLM_SpendLogs is partitioned; removed its primary-key "
+            "rewrite and partitioning artifacts from the drift script"
+        )
+        return filter_partitioned_spend_logs_diff(without_indexes)
+
+    @staticmethod
     def _resolve_all_migrations(
         migrations_dir: str, schema_path: str, mark_all_applied: bool = True
     ):
@@ -513,21 +530,14 @@ class ProxyExtrasDBManager:
             return
         logger.info(f"Migration diff created at {diff_sql_path}")
 
-        if ProxyExtrasDBManager.spend_logs_is_partitioned():
-            filtered_sql = filter_partitioned_spend_logs_diff(
-                diff_sql_path.read_text()
-            )
-            diff_sql_path.write_text(filtered_sql)
-            logger.info(
-                "LiteLLM_SpendLogs is partitioned; removed its primary-key "
-                "rewrite and partitioning artifacts from the drift script"
-            )
-            if not filtered_sql.strip():
-                logger.info("Drift script is empty after filtering; nothing to apply")
-                if not mark_all_applied:
-                    return
-                ProxyExtrasDBManager._mark_migrations_applied(migrations_dir)
+        filtered_sql: Final = ProxyExtrasDBManager._filter_startup_owned_drift(diff_sql_path.read_text())
+        diff_sql_path.write_text(filtered_sql)
+        if not filtered_sql.strip():
+            logger.info("Drift script is empty after filtering; nothing to apply")
+            if not mark_all_applied:
                 return
+            ProxyExtrasDBManager._mark_migrations_applied(migrations_dir)
+            return
 
         # 2. Run prisma db execute to apply the migration
         applied_ok = False
@@ -781,7 +791,10 @@ class ProxyExtrasDBManager:
         logger.info("%s invalid index %s.%s", action, index.schema, index.name)
 
     @staticmethod
-    def repair_invalid_indexes(lock_timeout: str = "30s") -> bool:
+    def repair_invalid_indexes(
+        lock_timeout: str = "30s",
+        repair: "Callable[[psycopg.Connection[tuple[str, str, str]], _InvalidIndex], None] | None" = None,
+    ) -> bool:
         """Rebuild LiteLLM indexes an interrupted CREATE INDEX CONCURRENTLY left
         INVALID (a migration deadlock between replicas is the usual cause; the
         retried migration skips them because of IF NOT EXISTS). Never raises:
@@ -790,7 +803,9 @@ class ProxyExtrasDBManager:
         schema DATABASE_URL names, the only URL Prisma migrates through, but
         connects over DIRECT_URL when set: the session settings, the advisory
         lock and REINDEX CONCURRENTLY all need one server session, which a
-        transaction pooler does not give."""
+        transaction pooler does not give. Each rebuild holds the migration
+        coordinator lock on its own, like the startup index build, so a resolver
+        booting on another replica waits for one index at most."""
         prisma_url: Final = os.getenv("DATABASE_URL")
         if not prisma_url:
             return False
@@ -826,8 +841,11 @@ class ProxyExtrasDBManager:
                 if lock_row is None or not lock_row[0]:
                     logger.info("Another replica is already rebuilding the invalid indexes, skipping")
                     return False
-                for index in ProxyExtrasDBManager._invalid_litellm_indexes(conn, schema):
-                    ProxyExtrasDBManager._repair_index(conn, index)
+                repair_one: Final = repair or ProxyExtrasDBManager._repair_index
+                if not all(
+                    ProxyExtrasDBManager._repair_under_migration_lock(conn, schema, index, repair_one) for index in found
+                ):
+                    return False
                 remaining: Final = ProxyExtrasDBManager._invalid_litellm_indexes(conn, schema)
         except psycopg.Error as e:
             logger.warning("Could not check for invalid indexes, will retry on the next startup. Error: %s", e)
@@ -835,11 +853,37 @@ class ProxyExtrasDBManager:
         return not remaining
 
     @staticmethod
+    def _repair_under_migration_lock(
+        conn: "psycopg.Connection[tuple[str, str, str]]",
+        schema: str,
+        index: _InvalidIndex,
+        repair: "Callable[[psycopg.Connection[tuple[str, str, str]], _InvalidIndex], None]",
+    ) -> bool:
+        """Rebuild one index under the migration coordinator lock, skipping it when a
+        startup build on another replica finished or dropped it in the meantime. False
+        when another replica holds the lock, so the check waits for the next startup."""
+        with held_migration_lock(conn) as held:
+            if not held:
+                logger.info(
+                    "Another replica is building indexes under the migration lock, leaving the "
+                    "invalid index check to the next startup"
+                )
+                return False
+            still_invalid: Final = ProxyExtrasDBManager._invalid_litellm_indexes(conn, schema)
+            if any(found.schema == index.schema and found.name == index.name for found in still_invalid):
+                repair(conn, index)
+            return True
+
+    @staticmethod
     def _setup_database_v2(use_migrate: bool) -> bool:
         if not use_migrate:
             return ProxyExtrasDBManager._run_database_v2(False)
         from litellm_proxy_extras.migration_lock import migration_environment, migration_lock
-        from litellm_proxy_extras.migration_recovery import baseline_current_schema, recover_completed_migration
+        from litellm_proxy_extras.migration_recovery import (
+            baseline_current_schema,
+            recover_completed_migration,
+            roll_back_failed_inert_migration,
+        )
 
         database_url: Final = os.environ.get("DATABASE_URL")
         if not database_url:
@@ -854,7 +898,9 @@ class ProxyExtrasDBManager:
             if not migration.is_file():
                 return False
             with migration_lock(lock_url) as coordinator:
-                return recover_completed_migration(coordinator, schema, migration)
+                return recover_completed_migration(coordinator, schema, migration) or roll_back_failed_inert_migration(
+                    coordinator, schema, migration
+                )
 
         def baseline_existing(migrations_dir: str) -> None:
             with migration_lock(lock_url) as coordinator:
@@ -1147,7 +1193,9 @@ class ProxyExtrasDBManager:
 
     @staticmethod
     def setup_database(
-        use_migrate: bool = False, use_v2_resolver: bool = False
+        use_migrate: bool = False,
+        use_v2_resolver: bool = False,
+        build_indexes_in_background: bool = True,
     ) -> bool:
         """
         Set up the database using either prisma migrate or prisma db push
@@ -1159,9 +1207,15 @@ class ProxyExtrasDBManager:
                 rolling deploys; does not run the diff-and-force recovery
                 that causes schema thrashing). Defaults to False for
                 backwards compatibility.
+            build_indexes_in_background: Build the startup-owned request-log
+                indexes on a daemon thread so a long build never delays
+                readiness, and report only the migration result. A process
+                that exits right after setup, such as the migration job,
+                passes False to wait for the build and report its result.
 
         Returns:
-            bool: True if setup was successful, False otherwise
+            bool: True if the migrations applied and, when waited for, the
+                request-log indexes are in place; False otherwise
         """
         ensure_prisma_toolchain(
             prisma_command=_get_prisma_command(), prisma_env=_get_prisma_env()
@@ -1169,10 +1223,31 @@ class ProxyExtrasDBManager:
         migrated = ProxyExtrasDBManager._run_migrations(
             use_migrate=use_migrate, use_v2_resolver=use_v2_resolver
         )
-        if migrated:
-            ProxyExtrasDBManager.repair_invalid_indexes()
-            ProxyExtrasDBManager.apply_replica_identity_full_if_requested()
-        return migrated
+        if not migrated:
+            return False
+        ProxyExtrasDBManager.repair_invalid_indexes()
+        ProxyExtrasDBManager.apply_replica_identity_full_if_requested()
+        return ProxyExtrasDBManager.build_request_log_indexes(in_background=build_indexes_in_background)
+
+    @staticmethod
+    def build_request_log_indexes(
+        in_background: bool, build: Callable[[str, str], bool] = ensure_request_log_indexes
+    ) -> bool:
+        """Build the indexes in `REQUEST_LOG_INDEXES` after migrations succeed. The
+        build is idempotent and never raises. In the background the result is True as
+        soon as the daemon thread starts: a serving proxy logs a failed build and retries
+        it on its next startup. Inline, the result is the build's, so a process that
+        exits right after setup, such as the migration job, reports the missing indexes
+        and gets rerun instead of leaving the table unindexed until the next deploy."""
+        database_url: Final = os.environ.get("DATABASE_URL")
+        if not database_url:
+            return True
+        direct_url: Final = ProxyExtrasDBManager._strip_prisma_query_params(os.environ.get("DIRECT_URL") or database_url)
+        schema: Final = ProxyExtrasDBManager._prisma_schema_param(database_url) or "public"
+        if not in_background:
+            return build(direct_url, schema)
+        threading.Thread(target=build, args=(direct_url, schema), name="litellm-request-log-indexes", daemon=True).start()
+        return True
 
     @staticmethod
     def _run_migrations(use_migrate: bool, use_v2_resolver: bool) -> bool:
@@ -1216,15 +1291,16 @@ class ProxyExtrasDBManager:
                         logger.info("✅ Post-migration sanity check completed")
                         return True
                     except subprocess.CalledProcessError as e:
-                        logger.info(f"prisma db error: {e.stderr}, e: {e.stdout}")
-                        if "P3009" in e.stderr:
+                        stderr: Final = str(e.stderr or "")
+                        logger.info(f"prisma db error: {stderr}, e: {e.stdout}")
+                        if "P3009" in stderr:
                             # Extract the failed migration name from the error message
                             migration_match = re.search(
-                                r"`(\d+_.*)` migration", e.stderr
+                                r"`(\d+_.*)` migration", stderr
                             )
                             if migration_match:
                                 failed_migration = migration_match.group(1)
-                                if ProxyExtrasDBManager._is_idempotent_error(e.stderr):
+                                if ProxyExtrasDBManager._is_idempotent_error(stderr):
                                     logger.info(
                                         f"Migration {failed_migration} failed due to idempotent error (e.g., column already exists), resolving as applied"
                                     )
@@ -1280,8 +1356,8 @@ class ProxyExtrasDBManager:
                                         f"✅ Migration {failed_migration} marked as rolled back... retrying"
                                     )
                         elif (
-                            "P3005" in e.stderr
-                            and "database schema is not empty" in e.stderr
+                            "P3005" in stderr
+                            and "database schema is not empty" in stderr
                         ):
                             logger.info(
                                 "Database schema is not empty, creating baseline migration. In read-only file system, please set an environment variable `LITELLM_MIGRATION_DIR` to a writable directory to enable migrations. Learn more - https://docs.litellm.ai/docs/proxy/prod#read-only-file-system"
@@ -1295,13 +1371,13 @@ class ProxyExtrasDBManager:
                             )
                             logger.info("✅ All migrations resolved.")
                             return True
-                        elif "P3018" in e.stderr:
+                        elif "P3018" in stderr:
                             # Check if this is a permission error or idempotent error
-                            if ProxyExtrasDBManager._is_permission_error(e.stderr):
+                            if ProxyExtrasDBManager._is_permission_error(stderr):
                                 # Permission errors should NOT be marked as applied
                                 # Extract migration name for logging
                                 migration_match = re.search(
-                                    r"Migration name: (\d+_.*)", e.stderr
+                                    r"Migration name: (\d+_.*)", stderr
                                 )
                                 migration_name = (
                                     migration_match.group(1)
@@ -1311,7 +1387,7 @@ class ProxyExtrasDBManager:
 
                                 logger.error(
                                     f"❌ Migration {migration_name} failed due to insufficient permissions. "
-                                    f"Please check database user privileges. Error: {e.stderr}"
+                                    f"Please check database user privileges. Error: {stderr}"
                                 )
 
                                 # Mark as rolled back and exit with error
@@ -1334,7 +1410,7 @@ class ProxyExtrasDBManager:
                                     f"was NOT applied. Please grant necessary database permissions and retry."
                                 ) from e
 
-                            elif ProxyExtrasDBManager._is_idempotent_error(e.stderr):
+                            elif ProxyExtrasDBManager._is_idempotent_error(stderr):
                                 # Idempotent errors mean the migration has effectively been applied
                                 logger.info(
                                     "Migration failed due to idempotent error (e.g., column already exists), "
@@ -1342,7 +1418,7 @@ class ProxyExtrasDBManager:
                                 )
                                 # Extract the migration name from the error message
                                 migration_match = re.search(
-                                    r"Migration name: (\d+_.*)", e.stderr
+                                    r"Migration name: (\d+_.*)", stderr
                                 )
                                 if migration_match:
                                     migration_name = migration_match.group(1)
@@ -1391,7 +1467,7 @@ class ProxyExtrasDBManager:
                                 logger.warning(
                                     f"P3018 error encountered but could not classify "
                                     f"as permission or idempotent error. "
-                                    f"Error: {e.stderr}"
+                                    f"Error: {stderr}"
                                 )
                                 raise
                 else:

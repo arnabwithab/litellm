@@ -2,6 +2,7 @@ import glob
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -1024,3 +1025,83 @@ class TestJWTKeyMappingCascade:
                 f"{path} must declare onDelete: Cascade on the JWT key mapping "
                 "relation (issue #33702)"
             )
+
+
+
+class TestBuildRequestLogIndexes:
+    """setup_database hands the startup-owned index build the direct database URL and
+    schema; in the background on a daemon thread so readiness never waits for it, inline
+    for a process that exits right after setup."""
+
+    @pytest.fixture
+    def builds(self):
+        return []
+
+    @pytest.fixture
+    def build(self, builds):
+        def record(database_url: str, schema: str) -> bool:
+            builds.append((database_url, schema))
+            return True
+
+        return record
+
+    def test_a_background_build_runs_on_a_daemon_thread_with_the_direct_url_and_schema(self, monkeypatch, builds):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@pooler:6543/db?schema=tenant&pgbouncer=true")
+        monkeypatch.setenv("DIRECT_URL", "postgresql://u:p@primary:5432/db?connection_limit=1")
+        done = threading.Event()
+
+        def build(database_url: str, schema: str) -> bool:
+            builds.append((database_url, schema, threading.current_thread().daemon))
+            done.set()
+            return False
+
+        assert ProxyExtrasDBManager.build_request_log_indexes(in_background=True, build=build) is True
+
+        assert done.wait(timeout=5)
+        assert builds == [("postgresql://u:p@primary:5432/db", "tenant", True)]
+
+    def test_an_inline_build_finishes_before_returning_and_defaults_to_the_public_schema(
+        self, monkeypatch, builds, build
+    ):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@primary:5432/db")
+        monkeypatch.delenv("DIRECT_URL", raising=False)
+
+        assert ProxyExtrasDBManager.build_request_log_indexes(in_background=False, build=build) is True
+
+        assert builds == [("postgresql://u:p@primary:5432/db", "public")]
+
+    def test_an_inline_build_that_leaves_indexes_missing_is_reported_so_the_job_reruns(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@primary:5432/db")
+
+        assert ProxyExtrasDBManager.build_request_log_indexes(in_background=False, build=lambda url, schema: False) is False
+
+    def test_without_a_database_url_nothing_is_built(self, monkeypatch, builds, build):
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+        assert ProxyExtrasDBManager.build_request_log_indexes(in_background=True, build=build) is True
+
+        assert builds == []
+
+
+class TestStartupOwnedDrift:
+    STARTUP_INDEXES = (
+        "-- CreateIndex\n"
+        'CREATE INDEX "LiteLLM_SpendLogs_litellm_call_id_idx" ON "LiteLLM_SpendLogs"("litellm_call_id");\n'
+        "\n-- CreateIndex\n"
+        'CREATE INDEX "LiteLLM_SpendLogs_api_key_startTime_idx" ON "LiteLLM_SpendLogs"("api_key", "startTime");\n'
+    )
+
+    def test_a_plain_spend_logs_table_only_loses_the_startup_indexes(self, monkeypatch):
+        monkeypatch.setattr(ProxyExtrasDBManager, "spend_logs_is_partitioned", staticmethod(lambda: False))
+        filtered = ProxyExtrasDBManager._filter_startup_owned_drift(_PARTITIONED_DRIFT_SQL + self.STARTUP_INDEXES)
+        assert "LiteLLM_SpendLogs_litellm_call_id_idx" not in filtered
+        assert "LiteLLM_SpendLogs_api_key_startTime_idx" not in filtered
+        assert 'PRIMARY KEY ("request_id")' in filtered
+
+    def test_a_partitioned_spend_logs_table_also_loses_its_partitioning_artifacts(self, monkeypatch):
+        monkeypatch.setattr(ProxyExtrasDBManager, "spend_logs_is_partitioned", staticmethod(lambda: True))
+        filtered = ProxyExtrasDBManager._filter_startup_owned_drift(_PARTITIONED_DRIFT_SQL + self.STARTUP_INDEXES)
+        assert "LiteLLM_SpendLogs_litellm_call_id_idx" not in filtered
+        assert 'PRIMARY KEY ("request_id")' not in filtered
+        assert "LiteLLM_SpendLogs_legacy" not in filtered
+        assert 'ALTER TABLE "LiteLLM_BudgetTable" ADD COLUMN     "updated_by" TEXT;' in filtered

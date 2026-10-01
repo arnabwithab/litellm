@@ -55,6 +55,7 @@ def main() -> int:
     ok = ProxyExtrasDBManager.setup_database(
         use_migrate=not use_db_push,
         use_v2_resolver=use_v2,
+        build_indexes_in_background=False,
     )
     if not ok:
         logger.error("Migration job failed after retries.")

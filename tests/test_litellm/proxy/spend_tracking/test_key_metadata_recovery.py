@@ -3,14 +3,13 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Final
 from unittest.mock import AsyncMock, MagicMock
 
-import litellm_proxy_extras
 import psycopg
 import pytest
+from litellm_proxy_extras.request_log_indexes import REQUEST_LOG_INDEXES
 from prisma.errors import PrismaError
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -620,11 +619,8 @@ _SPEND_LOGS_DDL: Final = """
     )
 """
 
-_API_KEY_START_TIME_INDEX_MIGRATION: Final = (
-    Path(litellm_proxy_extras.__file__).parent
-    / "migrations"
-    / "20260823000000_add_spend_logs_api_key_starttime_index"
-    / "migration.sql"
+_API_KEY_START_TIME_INDEX: Final = next(
+    index for index in REQUEST_LOG_INDEXES if index.name == "LiteLLM_SpendLogs_api_key_startTime_idx"
 )
 
 _SPEND_LOG_ROWS_READ_IN_THIS_TRANSACTION_SQL: Final = """
@@ -636,7 +632,10 @@ _SPEND_LOG_ROWS_READ_IN_THIS_TRANSACTION_SQL: Final = """
 
 def _create_spend_logs_table(conn: psycopg.Connection) -> None:
     conn.execute(_SPEND_LOGS_DDL)  # pyright: ignore[reportArgumentType]  # DDL literal
-    conn.execute(_API_KEY_START_TIME_INDEX_MIGRATION.read_text())  # pyright: ignore[reportArgumentType]  # migration file
+    conn.execute(
+        f'CREATE INDEX "{_API_KEY_START_TIME_INDEX.name}" ON "{_API_KEY_START_TIME_INDEX.table}" '  # pyright: ignore[reportArgumentType]  # DDL from the startup index list
+        f"{_API_KEY_START_TIME_INDEX.definition}"
+    )
 
 
 def _psycopg_prisma(conn: psycopg.Connection) -> MagicMock:

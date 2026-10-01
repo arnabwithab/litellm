@@ -911,7 +911,9 @@ class PrismaManager:
             raise RuntimeError(PARTITIONED_SPEND_LOGS_PUSH_ERROR)
 
     @staticmethod
-    def setup_database(use_migrate: bool = False, use_v2_resolver: bool = False) -> bool:
+    def setup_database(
+        use_migrate: bool = False, use_v2_resolver: bool = False, build_indexes_in_background: bool = True
+    ) -> bool:
         """
         Set up the database using either prisma migrate or prisma db push
 
@@ -920,6 +922,10 @@ class PrismaManager:
             use_v2_resolver: Opt into the v2 migration resolver that avoids
                 the diff-and-force recovery behavior (which caused schema
                 thrashing during rolling deploys). Defaults to False.
+            build_indexes_in_background: Build the startup-owned request-log
+                indexes on a background thread after the migrations, so a
+                long build never delays readiness. A process that exits
+                right after setup passes False to wait for the build.
 
         Returns:
             bool: True if setup was successful, False otherwise
@@ -942,6 +948,7 @@ class PrismaManager:
                     return ProxyExtrasDBManager.setup_database(
                         use_migrate=use_migrate,
                         use_v2_resolver=use_v2_resolver,
+                        build_indexes_in_background=build_indexes_in_background,
                     )
                 else:
                     try:

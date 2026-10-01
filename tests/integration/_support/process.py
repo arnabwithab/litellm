@@ -16,6 +16,10 @@ import httpx
 import psutil
 from integration._support.client import Gateway
 
+DB_PUSH: Final = ("--use_prisma_db_push",)
+MIGRATE_DEPLOY: Final = ()
+LEGACY_MIGRATE_DEPLOY: Final = ("--use_legacy_migration_resolver",)
+
 
 def proxy_database_environment() -> Mapping[str, str]:
     writer: Final = os.environ.get("INTEGRATION_PROXY_DATABASE_URL", "")
@@ -57,6 +61,10 @@ def stop_root_process(process: subprocess.Popen[bytes]) -> bool:
     return True
 
 
+def log_tail(log: Path, characters: int = 6000) -> str:
+    return log.read_text(errors="replace")[-characters:]
+
+
 @dataclass(frozen=True, slots=True)
 class OwnedProxy:
     gateway: Gateway
@@ -73,9 +81,16 @@ def owned_proxy(
     config: Path | None = None,
     remove_environment: tuple[str, ...] = (),
     workers: int = 1,
+    database_setup: tuple[str, ...] = DB_PUSH,
 ) -> Iterator[Gateway]:
     with owned_proxy_process(
-        gateway, directory, overrides, config=config, remove_environment=remove_environment, workers=workers
+        gateway,
+        directory,
+        overrides,
+        config=config,
+        remove_environment=remove_environment,
+        workers=workers,
+        database_setup=database_setup,
     ) as owned:
         yield owned.gateway
 
@@ -89,6 +104,7 @@ def owned_proxy_process(
     config: Path | None = None,
     remove_environment: tuple[str, ...] = (),
     workers: int = 1,
+    database_setup: tuple[str, ...] = DB_PUSH,
 ) -> Iterator[OwnedProxy]:
     with socket.socket() as reserve:
         reserve.bind(("127.0.0.1", 0))
@@ -122,7 +138,7 @@ def owned_proxy_process(
                 str(port),
                 "--num_workers",
                 str(workers),
-                "--use_prisma_db_push",
+                *database_setup,
                 "--enforce_prisma_migration_check",
             ],
             cwd=root,
@@ -135,7 +151,7 @@ def owned_proxy_process(
             with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=15, trust_env=False) as client:
                 deadline: Final = time.monotonic() + 70
                 while True:
-                    assert process.poll() is None, "Owned proxy exited before readiness"
+                    assert process.poll() is None, f"Owned proxy exited before readiness:\n{log_tail(log_path)}"
                     try:
                         if client.get("/health/readiness", timeout=2).status_code == 200:
                             break

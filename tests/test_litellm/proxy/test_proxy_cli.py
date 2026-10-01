@@ -2188,7 +2188,7 @@ class TestRunServerDbSetup:
             # use_prisma_db_push should be False (default), so use_migrate should be True
             run_server.main(["--local", "--skip_server_startup"], standalone_mode=False)
             mock_setup_database.assert_called_with(
-                use_migrate=True, use_v2_resolver=True
+                use_migrate=True, use_v2_resolver=True, build_indexes_in_background=False
             )
 
             # Reset mocks
@@ -2203,7 +2203,7 @@ class TestRunServerDbSetup:
                 standalone_mode=False,
             )
             mock_setup_database.assert_called_with(
-                use_migrate=False, use_v2_resolver=True
+                use_migrate=False, use_v2_resolver=True, build_indexes_in_background=False
             )
 
     @patch("atexit.register")
@@ -2263,7 +2263,7 @@ class TestRunServerDbSetup:
 
         assert "prisma CLI is neither on PATH" not in capsys.readouterr().out
         mock_setup_database.assert_called_once_with(
-            use_migrate=True, use_v2_resolver=True
+            use_migrate=True, use_v2_resolver=True, build_indexes_in_background=False
         )
 
     @patch("subprocess.run")
@@ -2330,7 +2330,7 @@ class TestRunServerDbSetup:
                 )
             assert exc_info.value.code == 1
             mock_setup_database.assert_called_once_with(
-                use_migrate=True, use_v2_resolver=True
+                use_migrate=True, use_v2_resolver=True, build_indexes_in_background=False
             )
 
     @patch("subprocess.run")
@@ -2440,7 +2440,7 @@ class TestRunServerDbSetup:
             )
 
         mock_setup_database.assert_called_once_with(
-            use_migrate=True, use_v2_resolver=True
+            use_migrate=True, use_v2_resolver=True, build_indexes_in_background=False
         )
         assert "--use_v2_migration_resolver is deprecated" not in capsys.readouterr().out
 
@@ -2534,7 +2534,7 @@ class TestRunServerDbSetup:
             )
 
         mock_setup_database.assert_called_once_with(
-            use_migrate=True, use_v2_resolver=False
+            use_migrate=True, use_v2_resolver=False, build_indexes_in_background=False
         )
 
 

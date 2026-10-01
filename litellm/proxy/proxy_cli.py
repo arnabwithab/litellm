@@ -1413,6 +1413,7 @@ def run_server(
                         setup_ok: Final = PrismaManager.setup_database(
                             use_migrate=not use_prisma_db_push,
                             use_v2_resolver=use_v2_resolver,
+                            build_indexes_in_background=not skip_server_startup,
                         )
                     except RuntimeError as e:
                         # Raised on unrecoverable migration errors: the v2
