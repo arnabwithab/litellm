@@ -197,6 +197,63 @@ async def test_interrupted_anthropic_stream_recovers_output_tokens_off_the_event
 
 
 @pytest.mark.asyncio
+async def test_anthropic_inband_error_stream_logs_as_failure():
+    from unittest.mock import AsyncMock
+
+    def _sse(event: str, data: dict) -> bytes:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
+
+    model = "claude-sonnet-4"
+    logging_obj = _logging_obj()
+    logging_obj.model_call_details = {"model": model, "stream": True}
+    logging_obj.litellm_params = {}
+    logging_obj.get_router_model_id.return_value = None
+    logging_obj.dispatch_success_handlers = AsyncMock()
+    logging_obj.dispatch_failure_handlers = AsyncMock()
+
+    raw_bytes = [
+        _sse(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                },
+            },
+        ),
+        _sse(
+            "content_block_delta",
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}},
+        ),
+        _sse("error", {"type": "error", "error": {"type": "api_error", "message": "upstream overloaded"}}),
+    ]
+
+    await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+        litellm_logging_obj=logging_obj,
+        passthrough_success_handler_obj=PassThroughEndpointLogging(),
+        url_route="/v1/messages",
+        request_body={"model": model, "stream": True},
+        endpoint_type=EndpointType.ANTHROPIC,
+        start_time=datetime.now(),
+        raw_bytes=raw_bytes,
+        end_time=datetime.now(),
+        model=model,
+    )
+    await GLOBAL_LOGGING_WORKER.flush()
+
+    logging_obj.dispatch_failure_handlers.assert_awaited_once()
+    logging_obj.dispatch_success_handlers.assert_not_awaited()
+    assert logging_obj.model_call_details.get("prompt_cache_response_complete") is not True
+
+
+@pytest.mark.asyncio
 async def test_failed_anthropic_stream_records_partial_usage_off_the_event_loop():
     from unittest.mock import AsyncMock
 

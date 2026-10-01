@@ -294,9 +294,11 @@ class PassThroughStreamingHandler:
         - Vertex AI
         - OpenAI
         """
+        from litellm.llms.anthropic.common_utils import AnthropicError
         from litellm.llms.anthropic.pass_through.messages.streaming_iterator import (
             _is_message_stop_chunk,  # pyright: ignore[reportPrivateUsage]  # both native stream paths share terminal-event detection
             _is_provider_error_chunk,  # pyright: ignore[reportPrivateUsage]  # provider errors must not become cache evidence
+            parse_anthropic_error_event,  # pyright: ignore[reportPrivateUsage]  # in-band SSE error must be logged as failure
         )
 
         # Transport reads can split event names and JSON payloads. Recognize terminal
@@ -312,6 +314,25 @@ class PassThroughStreamingHandler:
             and _is_message_stop_chunk(complete_frames)
             and not _is_provider_error_chunk(complete_frames)
         )
+        if endpoint_type == EndpointType.ANTHROPIC and _is_provider_error_chunk(complete_frames):
+            error_event = parse_anthropic_error_event(complete_frames)
+            if error_event is not None:
+                _, error_message, error_status = error_event
+            else:
+                error_message, error_status = "Anthropic stream error", 500
+            await PassThroughStreamingHandler.schedule_stream_failure_logging(
+                litellm_logging_obj=litellm_logging_obj,
+                endpoint_type=endpoint_type,
+                request_body=request_body,
+                raw_bytes=raw_bytes,
+                exception=AnthropicError(status_code=error_status, message=error_message),
+                stream_context=PassThroughStreamContext(
+                    passthrough_success_handler_obj=passthrough_success_handler_obj,
+                    url_route=url_route,
+                    start_time=start_time,
+                ),
+            )
+            return
         try:
             # TinyFish billing is owned by the detached poller; the $0 fallback below is only for streams with no run_id
             if endpoint_type == EndpointType.TINYFISH:
